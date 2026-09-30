@@ -6,12 +6,17 @@ import com.pharmacy.coldchain.domain.FollowUpRequest
 import com.pharmacy.coldchain.domain.OrderStatus
 import com.pharmacy.coldchain.domain.OutboundRequest
 import com.pharmacy.coldchain.domain.PhotoRequest
+import com.pharmacy.coldchain.domain.PickRequest
+import com.pharmacy.coldchain.domain.PrescriptionReturnRequest
 import com.pharmacy.coldchain.domain.RejudgmentRequest
+import com.pharmacy.coldchain.domain.ReReviewRequest
 import com.pharmacy.coldchain.domain.ResolutionRequest
+import com.pharmacy.coldchain.domain.ResumeConfirmRequest
 import com.pharmacy.coldchain.domain.ReviewRequest
 import com.pharmacy.coldchain.domain.Role
 import com.pharmacy.coldchain.service.FollowUpService
 import com.pharmacy.coldchain.service.OrderService
+import com.pharmacy.coldchain.service.PrescriptionReturnService
 import com.pharmacy.coldchain.service.ResolutionService
 import jakarta.servlet.http.HttpServletRequest
 import org.springframework.web.bind.annotation.GetMapping
@@ -28,7 +33,8 @@ import org.springframework.web.bind.annotation.RestController
 class OrderController(
     private val orders: OrderService,
     private val resolutions: ResolutionService,
-    private val followUps: FollowUpService
+    private val followUps: FollowUpService,
+    private val returns: PrescriptionReturnService
 ) {
 
     @PostMapping
@@ -90,6 +96,36 @@ class OrderController(
     @PostMapping("/{id}/outbound")
     fun outbound(@PathVariable id: String, @RequestBody req: OutboundRequest, request: HttpServletRequest) =
         Auth.require(request, Role.WAREHOUSE).let { (uid, _) -> orders.outbound(id, req, uid) }
+
+    /** 仓库拣货：锁定库存 + 医保预结算，进入已拣货待出库 */
+    @PostMapping("/{id}/pick")
+    fun pick(@PathVariable id: String, @RequestBody req: PickRequest, request: HttpServletRequest) =
+        Auth.require(request, Role.WAREHOUSE).let { (uid, _) -> orders.pick(id, req, uid) }
+
+    // ---------- 处方退回联动（剂量/适应症不符） ----------
+
+    /** 药师发起退回：暂停出库；已拣货未出库时库存锁定/医保结算/患者通知同步回滚 */
+    @PostMapping("/{id}/prescription-return")
+    fun prescriptionReturn(@PathVariable id: String, @RequestBody req: PrescriptionReturnRequest, request: HttpServletRequest) =
+        Auth.require(request, Role.PHARMACIST).let { (uid, _) -> returns.initiate(id, req, uid) }
+
+    /** 药师对患者补充材料重新审核（通过后库存重锁、医保重新预结算，等待最终确认） */
+    @PostMapping("/{id}/re-review")
+    fun reReview(@PathVariable id: String, @RequestBody req: ReReviewRequest, request: HttpServletRequest) =
+        Auth.require(request, Role.PHARMACIST).let { (uid, _) -> returns.reReview(id, req, uid) }
+
+    /** 恢复出库前药师再次确认 */
+    @PostMapping("/{id}/resume-confirmation")
+    fun resumeConfirmation(@PathVariable id: String, @RequestBody req: ResumeConfirmRequest, request: HttpServletRequest) =
+        Auth.require(request, Role.PHARMACIST).let { (uid, _) -> returns.confirmResume(id, req, uid) }
+
+    /** 处方退回联动 case 详情（含库存/医保/通知回滚与药师留痕） */
+    @GetMapping("/{id}/prescription-return")
+    fun prescriptionReturnDetail(@PathVariable id: String, request: HttpServletRequest): Any {
+        Auth.require(request, Role.PHARMACIST, Role.WAREHOUSE, Role.CUSTOMER_SERVICE, Role.INSURANCE, Role.COMPENSATION)
+        val cases = returns.byOrder(id)
+        return mapOf("orderId" to id, "cases" to cases, "active" to returns.activeCase(id))
+    }
 
     /** 药师重新判断药品是否仍可使用 */
     @PostMapping("/{id}/rejudgment")

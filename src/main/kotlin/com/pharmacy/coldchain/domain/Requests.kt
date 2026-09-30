@@ -96,6 +96,41 @@ data class FollowUpRequest(
     val note: String? = null
 )
 
+/** 仓库拣货（库存锁定 + 医保预结算），出库前按批号锁定 */
+data class PickRequest(
+    val batchNo: String
+)
+
+/** 库存入库（为拣货准备可用库存） */
+data class RestockRequest(
+    val drugName: String,
+    val batchNo: String,
+    val qty: Int
+)
+
+/** 药师发起处方退回联动：剂量不符 / 适应症不符 */
+data class PrescriptionReturnRequest(
+    val reason: ReturnReason,
+    val detail: String? = null
+)
+
+/** 患者补充处方材料 */
+data class SupplementRequest(
+    val url: String,
+    val note: String? = null
+)
+
+/** 药师对患者补充材料的重新审核（通过时 comment 作为恢复出库条件） */
+data class ReReviewRequest(
+    val approved: Boolean,
+    val comment: String? = null
+)
+
+/** 药师再次确认恢复出库（可注明恢复条件） */
+data class ResumeConfirmRequest(
+    val condition: String? = null
+)
+
 // ---------- 视图 DTO ----------
 
 data class TelemetrySummary(
@@ -119,7 +154,10 @@ data class PharmacyOrderView(
     val resolution: Resolution?,
     val payment: PaymentSplit?,
     val box: ColdChainBox?,
-    val followUps: List<FollowUp>
+    val followUps: List<FollowUp>,
+    val stockLock: StockLock?,
+    val settlement: SettlementInfo?,
+    val returnCase: PrescriptionReturnCase?
 )
 
 data class OverTempInfo(
@@ -152,7 +190,36 @@ data class PatientOrderView(
     val medicationReminders: List<String>,
     val riskReminders: List<String>,
     val sign: SignOff?,
-    val estimatedDeliveryAt: Long?
+    val estimatedDeliveryAt: Long?,
+    val prescriptionReturn: PrescriptionReturnView?
+)
+
+/** 医保结算当前状态（拣货预结算 / 退回回滚 / 重算 / 正式结算） */
+data class SettlementInfo(
+    val status: SettlementStatus,
+    val insuranceCents: Long,
+    val selfPayCents: Long,
+    val events: List<SettlementEvent>
+)
+
+/** 患者端看到的处方退回/恢复出库联动状态 */
+data class PrescriptionReturnView(
+    val caseId: String,
+    val status: ReturnCaseStatus,
+    val reason: ReturnReason,
+    val reasonLabel: String,
+    val reasonDetail: String?,
+    val pickedWhenReturned: Boolean,
+    val outboundPaused: Boolean,                 // 是否暂停出库
+    val needSupplement: Boolean,                 // 是否需要患者补充材料
+    val resumeCondition: String?,                // 恢复出库的条件
+    val canResumeOutbound: Boolean,              // 是否已具备恢复出库条件（待药师最终确认）
+    val supplements: List<SupplementMaterial>,
+    val stockLock: StockLock?,                   // 最新库存锁定（含锁定时间）
+    val settlement: SettlementInfo?,             // 医保结算状态
+    val notifications: List<PatientNotification>,
+    val initiatedAt: Long,
+    val resumedAt: Long?
 )
 
 /** 赔付处理建议（根据异常事件自动推导） */

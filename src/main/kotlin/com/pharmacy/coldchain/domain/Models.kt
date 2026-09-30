@@ -25,6 +25,18 @@ data class ColdChainOrder(
     var pharmacistReviewComment: String? = null,
     var pharmacistReviewedAt: Long? = null,
 
+    // 拣货（已拣货未出库：库存锁定 + 医保预结算）
+    var picked: Boolean = false,
+    var pickedAt: Long? = null,
+    var pickOperator: String? = null,
+    var stockLockId: String? = null,
+
+    // 处方退回联动
+    var returnCaseId: String? = null,
+    var outboundPausedAt: Long? = null,
+    var resumeConfirmedAt: Long? = null,
+    var resumeConfirmedBy: String? = null,
+
     // 出库记录
     var batchNo: String? = null,
     var expiryDate: String? = null,          // YYYY-MM-DD
@@ -137,7 +149,8 @@ data class PaymentSplit(
     val selfPayCents: Long,
     var refundedInsuranceCents: Long = 0,
     var refundedSelfPayCents: Long = 0,
-    var refundStatus: RefundStatus = RefundStatus.NONE
+    var refundStatus: RefundStatus = RefundStatus.NONE,
+    var settlementStatus: SettlementStatus = SettlementStatus.NONE
 )
 
 /** 冷链保温箱（循环使用） */
@@ -176,5 +189,119 @@ data class PrescriptionPhoto(
     val url: String,
     val uploadedBy: String,
     val note: String? = null,
+    val at: Long
+)
+
+// ---------- 处方退回联动：库存 / 医保结算 / 患者通知 / 退回 case ----------
+
+/** 库存商品（按药品名 + 批号维度维护可用库存） */
+data class StockItem(
+    val drugName: String,
+    val batchNo: String,
+    var availableQty: Int = 0
+)
+
+/**
+ * 库存锁定记录（拣货锁定 → 退回回滚释放 / 出库扣减）。
+ * 重新审核后按新记录重锁，lockNo 递增，锁定时间随之更新。
+ */
+data class StockLock(
+    val id: String,
+    val orderId: String,
+    val drugName: String,
+    val batchNo: String,
+    val qty: Int,
+    var status: StockLockStatus,
+    val lockedAt: Long,
+    var releasedAt: Long? = null,
+    var releaseReason: String? = null,
+    val lockNo: Int = 1,
+    val operator: String
+)
+
+/** 医保结算事件流水（预结算 / 回滚 / 重新预结算 / 正式结算） */
+data class SettlementEvent(
+    val id: String,
+    val orderId: String,
+    val action: SettlementStatus,   // PRE_SETTLED / ROLLED_BACK / SETTLED
+    val insuranceCents: Long,
+    val selfPayCents: Long,
+    val operator: String,
+    val note: String?,
+    val at: Long
+)
+
+/** 患者通知（退回补充 / 恢复出库），撤回时状态置 RECALLED */
+data class PatientNotification(
+    val id: String,
+    val orderId: String,
+    val patientId: String,
+    val type: NotificationType,
+    val title: String,
+    val content: String,
+    var status: NotificationStatus = NotificationStatus.SENT,
+    val sentBy: String,
+    val sentAt: Long,
+    var recalledAt: Long? = null
+)
+
+/** 患者补充的处方材料 */
+data class SupplementMaterial(
+    val id: String,
+    val orderId: String,
+    val url: String,
+    val note: String?,
+    val uploadedBy: String,
+    val at: Long
+)
+
+/**
+ * 处方退回联动 case（药师留痕的主体）：
+ * 一次"退回 → 补充 → 重审 → 确认恢复"的完整记录，包含库存/医保/通知三项联动结果。
+ */
+data class PrescriptionReturnCase(
+    val id: String,
+    val orderId: String,
+    var status: ReturnCaseStatus,
+
+    // 退回
+    val reason: ReturnReason,
+    val reasonDetail: String?,
+    val initiatedBy: String,
+    val initiatedAt: Long,
+    val pickedWhenReturned: Boolean,    // 退回时是否已拣货（决定是否触发三项回滚）
+
+    // 回滚结果
+    var rolledBackLockId: String? = null,
+    var lockReleasedAt: Long? = null,
+    var settlementRolledBackAt: Long? = null,
+    var returnNotificationId: String? = null,
+
+    // 患者补充
+    val supplements: MutableList<SupplementMaterial> = mutableListOf(),
+    var resuppliedAt: Long? = null,
+
+    // 重新审核
+    var reReviewedAt: Long? = null,
+    var reReviewedBy: String? = null,
+    var reReviewComment: String? = null,
+    var relockId: String? = null,
+    var relockAt: Long? = null,
+    var reSettledAt: Long? = null,
+    var resumeNotificationId: String? = null,
+
+    // 药师再次确认恢复
+    var resumeConfirmedBy: String? = null,
+    var resumeConfirmedAt: Long? = null,
+    var resumeCondition: String? = null,
+
+    val auditTrail: MutableList<ReturnAuditEntry> = mutableListOf()
+)
+
+/** 退回联动操作留痕条目 */
+data class ReturnAuditEntry(
+    val action: String,
+    val operator: String,
+    val detail: String,
     val at: Long
 )

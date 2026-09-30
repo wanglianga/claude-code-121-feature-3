@@ -15,7 +15,9 @@ import com.pharmacy.coldchain.domain.OverTempInfo
 import com.pharmacy.coldchain.domain.PatientOrderView
 import com.pharmacy.coldchain.domain.PharmacyOrderView
 import com.pharmacy.coldchain.domain.PhotoRequest
+import com.pharmacy.coldchain.domain.PickRequest
 import com.pharmacy.coldchain.domain.PrescriptionPhoto
+import com.pharmacy.coldchain.domain.NotificationType
 import com.pharmacy.coldchain.domain.ReceiverType
 import com.pharmacy.coldchain.domain.RefundInfo
 import com.pharmacy.coldchain.domain.RefundStatus
@@ -44,7 +46,10 @@ class OrderService(
     private val store: JsonStore,
     private val incidents: IncidentService,
     private val boxes: BoxService,
-    private val payments: PaymentService
+    private val payments: PaymentService,
+    private val stocks: StockService,
+    private val returns: PrescriptionReturnService,
+    private val notifications: NotificationService
 ) {
 
     // ---------- 下单 ----------
@@ -144,11 +149,37 @@ class OrderService(
         return save(o)
     }
 
-    // ---------- 出库 ----------
+    // ---------- 拣货（库存锁定 + 医保预结算） / 出库 ----------
+
+    /**
+     * 仓库拣货：按批号锁定库存并完成医保预结算，订单进入"已拣货待出库"。
+     * 此阶段若药师发起处方退回，库存锁定、医保结算、患者通知会同步回滚。
+     */
+    fun pick(orderId: String, req: PickRequest, operator: String): ColdChainOrder {
+        val o = orders.require(orderId)
+        requireStatus(o, OrderStatus.READY_FOR_OUTBOUND)
+        if (o.picked) throw ConflictException("订单 ${o.id} 已拣货，不能重复拣货")
+        val lock = stocks.lock(o, req.batchNo, operator)
+        payments.preSettle(orderId, operator)
+
+        o.picked = true
+        o.pickedAt = System.currentTimeMillis()
+        o.pickOperator = operator
+        o.stockLockId = lock.id
+        o.status = OrderStatus.PICKED
+        save(o)
+        notifications.send(
+            o.id, o.patientId, NotificationType.PICKED_READY,
+            "药品已拣货，即将出库",
+            "您的 ${o.drugName}（批号 ${req.batchNo}）已拣货完成，医保已预结算，即将冷链出库。",
+            operator
+        )
+        return o
+    }
 
     fun outbound(orderId: String, req: OutboundRequest, operator: String): ColdChainOrder {
         val o = orders.require(orderId)
-        requireStatus(o, OrderStatus.READY_FOR_OUTBOUND)
+        requireStatus(o, OrderStatus.READY_FOR_OUTBOUND, OrderStatus.PICKED)
         if (req.icePackCount < 1) throw BadRequestException("冰袋数量必须 ≥ 1")
         val expiry = runCatching { LocalDate.parse(req.expiryDate) }.getOrNull()
             ?: throw BadRequestException("有效期格式应为 YYYY-MM-DD: ${req.expiryDate}")
@@ -161,7 +192,28 @@ class OrderService(
         if (box.status != BoxStatus.READY) {
             throw ConflictException("保温箱 ${req.boxNo} 当前状态为 ${box.status}，不可用于出库")
         }
+
+        // 库存锁定 → 出库扣减；医保预结算 → 正式结算。
+        // 已拣货：批号须与拣货批号一致；未拣货（直接出库，兼容原流程）：有纳管库存则即时扣减，无账本则跳过。
         val now = System.currentTimeMillis()
+        if (o.picked) {
+            val lock = o.stockLockId?.let { stocks.findLock(it) }
+                ?: throw ConflictException("订单 ${o.id} 已拣货但缺少库存锁定记录，不能出库")
+            if (lock.batchNo != req.batchNo) {
+                throw ConflictException("出库批号 ${req.batchNo} 与拣货锁定批号 ${lock.batchNo} 不一致，不能出库")
+            }
+            stocks.deduct(lock.id)
+            payments.settle(orderId, operator)
+        } else {
+            val lock = stocks.immediateDeduct(o, req.batchNo, operator)
+            payments.preSettle(orderId, operator, "直接出库，医保预结算")
+            payments.settle(orderId, operator)
+            o.picked = true
+            o.pickedAt = now
+            o.pickOperator = operator
+            o.stockLockId = lock?.id
+        }
+
         box.status = BoxStatus.IN_USE
         box.currentOrderId = o.id
         box.history.add(o.id)
@@ -296,6 +348,7 @@ class OrderService(
             lastLat = telemetry.lastOrNull { it.lat != null }?.lat,
             lastLng = telemetry.lastOrNull { it.lng != null }?.lng
         )
+        val (returnCase, _) = returns.pharmacyView(orderId)
         return PharmacyOrderView(
             order = o,
             drugUsable = when (o.usability) {
@@ -310,7 +363,10 @@ class OrderService(
             resolution = store.get<Resolution>("resolution:$orderId"),
             payment = payments.get(orderId),
             box = o.boxNo?.let { boxes.find(it) },
-            followUps = store.lrangeJson("followup:$orderId")
+            followUps = store.lrangeJson("followup:$orderId"),
+            stockLock = o.stockLockId?.let { stocks.findLock(it) } ?: stocks.activeLock(orderId),
+            settlement = payments.settlementInfo(orderId),
+            returnCase = returnCase
         )
     }
 
@@ -344,7 +400,8 @@ class OrderService(
             medicationReminders = o.medicationReminders,
             riskReminders = o.riskReminders,
             sign = o.signOff,
-            estimatedDeliveryAt = o.estimatedDeliveryAt
+            estimatedDeliveryAt = o.estimatedDeliveryAt,
+            prescriptionReturn = returns.patientView(orderId, patientId)
         )
     }
 
