@@ -87,6 +87,35 @@ class ColdChainFlowTests {
             "appearanceOk" to true, "tempLabelOk" to true, "reminderAcknowledged" to true
         ), "PATIENT", patientId)
 
+    /** 推进到待出库（待拣货）：照片归档 → 处方审核 → 药师复核 */
+    private fun toReady(orderId: String) {
+        assertThat(post("/api/orders/$orderId/prescription-photos",
+            mapOf("url" to "https://img.example.com/rx/$orderId.jpg"), "PHARMACIST", "pharmacist-1").statusCode.value()).isEqualTo(200)
+        assertThat(post("/api/orders/$orderId/prescription-review",
+            mapOf("approved" to true), "PHARMACIST", "pharmacist-1").statusCode.value()).isEqualTo(200)
+        assertThat(post("/api/orders/$orderId/pharmacist-review",
+            mapOf("approved" to true), "PHARMACIST", "pharmacist-2").statusCode.value()).isEqualTo(200)
+    }
+
+    private fun pickStock(orderId: String, batchNo: String = "B20260901"): ResponseEntity<JsonNode> =
+        post("/api/orders/$orderId/pick-stock",
+            mapOf("batchNo" to batchNo, "pickedBy" to "warehouse-1"), "WAREHOUSE", "warehouse-1")
+
+    private fun returnPrescription(
+        orderId: String,
+        reason: String = "DOSAGE_MISMATCH",
+        detail: String = "处方单次剂量 40U 超过说明书单次上限 20U"
+    ): ResponseEntity<JsonNode> =
+        post("/api/orders/$orderId/prescription-return", mapOf(
+            "reason" to reason, "detail" to detail
+        ), "PHARMACIST", "pharmacist-1")
+
+    private fun supplement(orderId: String, note: String = "已补充医师确认剂量的处方"): ResponseEntity<JsonNode> =
+        post("/api/orders/$orderId/supplement", mapOf(
+            "note" to note,
+            "photos" to listOf(mapOf("url" to "https://img.example.com/rx/$orderId-supplement.jpg"))
+        ), "PATIENT", "patient-1")
+
     // ---------- 用例 ----------
 
     @Test
@@ -445,5 +474,184 @@ class ColdChainFlowTests {
             "icePackCount" to 1, "outboundTempC" to 5.0, "etaMinutes" to 30
         ), "WAREHOUSE", "warehouse-1")
         assertThat(conflict.statusCode.value()).isEqualTo(409)
+    }
+
+    @Test
+    fun `处方退回联动：已拣货退回同步回滚，补充重审更新锁定与结算，再次确认后恢复出库`() {
+        val orderId = createOrder()
+        toReady(orderId)
+
+        // 拣货：库存锁定 + 医保预结算
+        val picked = pickStock(orderId)
+        assertThat(picked.statusCode.value()).isEqualTo(200)
+        assertThat(picked.body!!.get("pickedAt").asLong()).isGreaterThan(0)
+        val pay0 = get("/api/orders/$orderId/payment-split", "INSURANCE", "insurance-1").body!!
+        assertThat(pay0.get("settlementStatus").asText()).isEqualTo("PRE_SETTLED")
+
+        // 药师审核发现剂量不符 → 退回，暂停出库
+        val ret = returnPrescription(orderId)
+        assertThat(ret.statusCode.value()).isEqualTo(200)
+        assertThat(ret.body!!.get("status").asText()).isEqualTo("RETURNED")
+        assertThat(ret.body!!.get("drugPicked").asBoolean()).isTrue()
+
+        // 药店视角：订单暂停、库存锁定回滚、医保结算回滚
+        val view0 = get("/api/orders/$orderId", "PHARMACIST", "pharmacist-1").body!!
+        assertThat(view0.get("order").get("status").asText()).isEqualTo("PRESCRIPTION_RETURNED")
+        assertThat(view0.get("inventoryLock").get("status").asText()).isEqualTo("ROLLED_BACK")
+        assertThat(view0.get("inventoryLock").get("rolledBackAt").asLong()).isGreaterThan(0)
+        assertThat(view0.get("payment").get("settlementStatus").asText()).isEqualTo("ROLLED_BACK")
+        assertThat(view0.get("incidents").any { it.get("type").asText() == "PRESCRIPTION_RETURNED" }).isTrue()
+
+        // 退回期间不能出库
+        val outboundDuringReturn = post("/api/orders/$orderId/outbound", mapOf(
+            "batchNo" to "B20260901", "expiryDate" to "2027-06-30", "boxNo" to "BOX-010",
+            "icePackCount" to 2, "outboundTempC" to 5.0, "etaMinutes" to 45
+        ), "WAREHOUSE", "warehouse-1")
+        assertThat(outboundDuringReturn.statusCode.value()).isEqualTo(409)
+
+        // 患者端：退回原因、需补材料、回滚情况、恢复条件（均未满足）、回滚通知
+        val pv0 = get("/api/patient/orders/$orderId", "PATIENT", "patient-1").body!!
+        val pr0 = pv0.get("prescriptionReturn")
+        assertThat(pr0.get("active").asBoolean()).isTrue()
+        assertThat(pr0.get("reason").asText()).isEqualTo("DOSAGE_MISMATCH")
+        assertThat(pr0.get("requiredMaterials").size()).isGreaterThan(0)
+        assertThat(pr0.get("rollback").get("inventoryRolledBack").asBoolean()).isTrue()
+        assertThat(pr0.get("rollback").get("settlementRolledBack").asBoolean()).isTrue()
+        assertThat(pr0.get("allConditionsMet").asBoolean()).isFalse()
+        assertThat(pv0.get("notifications").any { it.get("type").asText() == "ROLLBACK_DONE" }).isTrue()
+        assertThat(pv0.get("notifications").any { it.get("type").asText() == "PRESCRIPTION_RETURNED" }).isTrue()
+
+        // 患者补充材料
+        val supp = supplement(orderId)
+        assertThat(supp.statusCode.value()).isEqualTo(200)
+        assertThat(supp.body!!.get("status").asText()).isEqualTo("SUPPLEMENTED")
+        // 未重新审核不能恢复确认
+        assertThat(post("/api/orders/$orderId/resume-confirm", null, "PHARMACIST", "pharmacist-1")
+            .statusCode.value()).isEqualTo(409)
+
+        // 药师重新审核通过 → 库存重新锁定（锁定时间更新）、医保重新预结算
+        val rr = post("/api/orders/$orderId/re-review",
+            mapOf("approved" to true, "comment" to "剂量已由医师重新确认"), "PHARMACIST", "pharmacist-1")
+        assertThat(rr.statusCode.value()).isEqualTo(200)
+        assertThat(rr.body!!.get("status").asText()).isEqualTo("AWAITING_RESUME_CONFIRM")
+        val view1 = get("/api/orders/$orderId", "PHARMACIST", "pharmacist-1").body!!
+        assertThat(view1.get("inventoryLock").get("status").asText()).isEqualTo("RELOCKED")
+        assertThat(view1.get("inventoryLock").get("relockedAt").asLong())
+            .isGreaterThan(view1.get("inventoryLock").get("rolledBackAt").asLong())
+        assertThat(view1.get("payment").get("settlementStatus").asText()).isEqualTo("RESETTLED")
+
+        // 恢复出库前仍不能直接出库（必须药师再次确认）
+        assertThat(post("/api/orders/$orderId/outbound", mapOf(
+            "batchNo" to "B20260901", "expiryDate" to "2027-06-30", "boxNo" to "BOX-010",
+            "icePackCount" to 2, "outboundTempC" to 5.0, "etaMinutes" to 45
+        ), "WAREHOUSE", "warehouse-1").statusCode.value()).isEqualTo(409)
+
+        // 患者端：仅剩"药师再次确认"条件未满足，可见恢复条件提示
+        val pv1 = get("/api/patient/orders/$orderId", "PATIENT", "patient-1").body!!
+        assertThat(pv1.get("prescriptionReturn").get("allConditionsMet").asBoolean()).isFalse()
+        val confirmCond = pv1.get("prescriptionReturn").get("resumeConditions").toList()
+            .single { it.get("text").asText().contains("再次确认") }
+        assertThat(confirmCond.get("met").asBoolean()).isFalse()
+        assertThat(pv1.get("notifications").any { it.get("type").asText() == "READY_TO_RESUME" }).isTrue()
+
+        // 药师再次确认 → 恢复出库
+        val resume = post("/api/orders/$orderId/resume-confirm", null, "PHARMACIST", "pharmacist-2")
+        assertThat(resume.statusCode.value()).isEqualTo(200)
+        assertThat(resume.body!!.get("status").asText()).isEqualTo("READY_FOR_OUTBOUND")
+
+        // 患者端：恢复提示，条件全部满足
+        val pv2 = get("/api/patient/orders/$orderId", "PATIENT", "patient-1").body!!
+        assertThat(pv2.get("prescriptionReturn").get("allConditionsMet").asBoolean()).isTrue()
+        assertThat(pv2.get("notifications").any { it.get("type").asText() == "OUTBOUND_RESUMED" }).isTrue()
+
+        // 药师留痕：退回 / 重审 / 恢复确认 三条齐全
+        val audit = get("/api/orders/$orderId/pharmacist-audit", "CUSTOMER_SERVICE", "cs-1").body!!
+        val actions = audit.map { it.get("action").asText() }
+        assertThat(actions).contains("PRESCRIPTION_RETURN", "RE_REVIEW_APPROVE", "RESUME_CONFIRM")
+
+        // 恢复后正常出库：锁定释放，流程可继续
+        val out = post("/api/orders/$orderId/outbound", mapOf(
+            "batchNo" to "B20260901", "expiryDate" to "2027-06-30", "boxNo" to "BOX-010",
+            "icePackCount" to 2, "outboundTempC" to 5.0, "etaMinutes" to 45
+        ), "WAREHOUSE", "warehouse-1")
+        assertThat(out.statusCode.value()).isEqualTo(200)
+        val view2 = get("/api/orders/$orderId", "PHARMACIST", "pharmacist-1").body!!
+        assertThat(view2.get("inventoryLock").get("status").asText()).isEqualTo("RELEASED")
+        assertThat(view2.get("incidents").all { it.get("status").asText() == "RESOLVED" }).isTrue()
+    }
+
+    @Test
+    fun `未拣货处方退回：仅暂停出库并通知，无资源回滚；补充重审确认后恢复出库`() {
+        val orderId = createOrder()
+        toReady(orderId)
+
+        val ret = post("/api/orders/$orderId/prescription-return", mapOf(
+            "reason" to "INDICATION_MISMATCH", "detail" to "处方诊断与药品适应症不符"
+        ), "PHARMACIST", "pharmacist-1")
+        assertThat(ret.statusCode.value()).isEqualTo(200)
+        assertThat(ret.body!!.get("drugPicked").asBoolean()).isFalse()
+
+        val pv = get("/api/patient/orders/$orderId", "PATIENT", "patient-1").body!!
+        assertThat(pv.get("prescriptionReturn").get("active").asBoolean()).isTrue()
+        assertThat(pv.get("prescriptionReturn").get("rollback").isNull).isTrue()
+        assertThat(pv.get("notifications").any { it.get("type").asText() == "PRESCRIPTION_RETURNED" }).isTrue()
+        assertThat(pv.get("notifications").any { it.get("type").asText() == "ROLLBACK_DONE" }).isFalse()
+
+        supplement(orderId, note = "已上传诊断证明与医师重新签章的处方")
+        assertThat(post("/api/orders/$orderId/re-review",
+            mapOf("approved" to true, "comment" to "适应症已核对"), "PHARMACIST", "pharmacist-1")
+            .body!!.get("status").asText()).isEqualTo("AWAITING_RESUME_CONFIRM")
+
+        // 未拣货 → 无锁定记录
+        val view = get("/api/orders/$orderId", "PHARMACIST", "pharmacist-1").body!!
+        assertThat(view.get("inventoryLock").isNull).isTrue()
+
+        assertThat(post("/api/orders/$orderId/resume-confirm", null, "PHARMACIST", "pharmacist-1")
+            .body!!.get("status").asText()).isEqualTo("READY_FOR_OUTBOUND")
+        val out = post("/api/orders/$orderId/outbound", mapOf(
+            "batchNo" to "B20260911", "expiryDate" to "2027-06-30", "boxNo" to "BOX-011",
+            "icePackCount" to 1, "outboundTempC" to 6.0, "etaMinutes" to 30
+        ), "WAREHOUSE", "warehouse-1")
+        assertThat(out.statusCode.value()).isEqualTo(200)
+    }
+
+    @Test
+    fun `重审不通过需继续补充；患者越权与角色校验拦截；通知列表可查`() {
+        val orderId = createOrder()
+        toReady(orderId)
+        pickStock(orderId)
+        returnPrescription(orderId)
+
+        // 患者不能执行药师退回操作
+        assertThat(post("/api/orders/$orderId/prescription-return",
+            mapOf("reason" to "OTHER", "detail" to "x"), "PATIENT", "patient-1")
+            .statusCode.value()).isEqualTo(403)
+        // 其他患者不能补充材料
+        assertThat(post("/api/orders/$orderId/supplement",
+            mapOf("note" to "x"), "PATIENT", "patient-2").statusCode.value()).isEqualTo(403)
+        // 未补充材料不能重审通过
+        assertThat(post("/api/orders/$orderId/re-review",
+            mapOf("approved" to true), "PHARMACIST", "pharmacist-1").statusCode.value()).isEqualTo(409)
+        // 空材料补充被拒绝
+        assertThat(post("/api/orders/$orderId/supplement",
+            mapOf<String, Any>(), "PATIENT", "patient-1").statusCode.value()).isEqualTo(400)
+
+        supplement(orderId)
+        // 重审不通过 → 退回单回到待补充
+        val rejected = post("/api/orders/$orderId/re-review",
+            mapOf("approved" to false, "comment" to "证明仍不清晰"), "PHARMACIST", "pharmacist-1")
+        assertThat(rejected.statusCode.value()).isEqualTo(200)
+        val pv = get("/api/patient/orders/$orderId", "PATIENT", "patient-1").body!!
+        assertThat(pv.get("prescriptionReturn").get("status").asText()).isEqualTo("RETURNED")
+
+        // 继续补充后可再次送审通过
+        supplement(orderId, note = "重新上传清晰证明")
+        assertThat(post("/api/orders/$orderId/re-review",
+            mapOf("approved" to true), "PHARMACIST", "pharmacist-1").statusCode.value()).isEqualTo(200)
+
+        // 患者通知列表可查（含拣货、退回、回滚、补充签收、重审、待确认）
+        val notifs = get("/api/patient/notifications", "PATIENT", "patient-1").body!!
+        assertThat(notifs.any { it.get("orderId").asText() == orderId }).isTrue()
+        assertThat(notifs.count { it.get("orderId").asText() == orderId }).isGreaterThanOrEqualTo(5)
     }
 }

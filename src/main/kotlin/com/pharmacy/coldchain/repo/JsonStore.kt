@@ -14,7 +14,11 @@ import org.springframework.stereotype.Component
  *   incident:{id} + idx:incident:order:{orderId}   异常事件
  *   rejudgment:{orderId}         药师重判 list
  *   resolution:{orderId}         最终处理结果
- *   payment:{orderId}            医保自费拆分
+ *   payment:{orderId}            医保自费拆分、退款与预结算状态
+ *   lock:{orderId}               拣货库存锁定（退回联动回滚/重新锁定）
+ *   rxreturn:{orderId}           处方退回联动记录
+ *   audit:{orderId}              药师留痕
+ *   notify:{patientId} + idx:notify:order:{orderId}  患者通知
  *   box:{boxNo} + idx:boxes      保温箱
  *   training:{riderId}           骑手培训 list
  *   followup:{orderId}           用药回访 list

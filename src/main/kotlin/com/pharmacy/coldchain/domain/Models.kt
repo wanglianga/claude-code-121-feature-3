@@ -35,6 +35,17 @@ data class ColdChainOrder(
     var outboundAt: Long? = null,
     var warehouseOperator: String? = null,
 
+    // 拣货（已拣货未出库期间持有库存锁定）
+    var pickedAt: Long? = null,
+    var pickedBy: String? = null,
+
+    // 处方退回联动时间线
+    var prescriptionReturnId: String? = null,
+    var returnedAt: Long? = null,
+    var supplementedAt: Long? = null,
+    var reReviewedAt: Long? = null,
+    var resumeConfirmedAt: Long? = null,
+
     // 配送过程
     var riderId: String? = null,
     var pickedUpAt: Long? = null,
@@ -137,7 +148,13 @@ data class PaymentSplit(
     val selfPayCents: Long,
     var refundedInsuranceCents: Long = 0,
     var refundedSelfPayCents: Long = 0,
-    var refundStatus: RefundStatus = RefundStatus.NONE
+    var refundStatus: RefundStatus = RefundStatus.NONE,
+    // 处方退回联动：医保预结算状态机（预结算 → 退回回滚 → 重新预结算）
+    var settlementStatus: SettlementStatus = SettlementStatus.NONE,
+    var preSettledAt: Long? = null,
+    var settlementRolledBackAt: Long? = null,
+    var resettledAt: Long? = null,
+    val settlementHistory: MutableList<String> = mutableListOf()
 )
 
 /** 冷链保温箱（循环使用） */
@@ -176,5 +193,69 @@ data class PrescriptionPhoto(
     val url: String,
     val uploadedBy: String,
     val note: String? = null,
+    val at: Long
+)
+
+/**
+ * 处方退回联动记录（药师审核发现处方剂量或适应症不符）。
+ * Redis key: rxreturn:{orderId}（list，每退回一次追加一条，支持多次退回）。
+ * 暂停出库期间，若药品已拣货，库存锁定 / 医保预结算 / 患者通知同步回滚。
+ */
+data class PrescriptionReturn(
+    val id: String,
+    val orderId: String,
+    val reason: PrescriptionReturnReason,
+    val detail: String,
+    val pharmacistId: String,
+    val drugPicked: Boolean,              // 退回时药品是否已拣货（决定是否需要回滚资源）
+    var status: PrescriptionReturnStatus,
+    var requiredMaterials: List<String> = emptyList(), // 要求患者补充的材料
+    var supplementNote: String? = null,
+    var supplementedBy: String? = null,
+    var supplementedAt: Long? = null,
+    var supplementPhotoIds: List<String> = emptyList(),
+    var reReviewPharmacistId: String? = null,
+    var reReviewComment: String? = null,
+    var reReviewedAt: Long? = null,
+    var resumeConfirmedBy: String? = null,
+    var resumeConfirmedAt: Long? = null,
+    val createdAt: Long
+)
+
+/** 库存锁定（拣货即锁定；退回联动回滚；重审通过重新锁定）。Redis key: lock:{orderId} */
+data class InventoryLock(
+    val orderId: String,
+    val drugName: String,
+    val batchNo: String?,
+    val quantity: Int,
+    var status: InventoryLockStatus,
+    var lockedAt: Long,
+    var lockedBy: String,
+    var rolledBackAt: Long? = null,
+    var rollBackReason: String? = null,
+    var relockedAt: Long? = null,
+    var releasedAt: Long? = null
+)
+
+/** 患者通知（患者端可见的联动状态与恢复条件）。Redis list: notify:{patientId} */
+data class PatientNotification(
+    val id: String,
+    val patientId: String,
+    val orderId: String,
+    val type: NotificationType,
+    val title: String,
+    val content: String,
+    val resumeConditions: List<String> = emptyList(),  // 恢复出库需满足的条件
+    var read: Boolean = false,
+    val createdAt: Long
+)
+
+/** 药师留痕条目（退回/重审/恢复确认全过程审计）。Redis list: audit:{orderId} */
+data class PharmacistAuditEntry(
+    val id: String,
+    val orderId: String,
+    val pharmacistId: String,
+    val action: String,       // PRESCRIPTION_RETURN / RE_REVIEW_APPROVE / RESUME_CONFIRM
+    val detail: String,
     val at: Long
 )

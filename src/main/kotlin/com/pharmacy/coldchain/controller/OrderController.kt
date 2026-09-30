@@ -6,9 +6,12 @@ import com.pharmacy.coldchain.domain.FollowUpRequest
 import com.pharmacy.coldchain.domain.OrderStatus
 import com.pharmacy.coldchain.domain.OutboundRequest
 import com.pharmacy.coldchain.domain.PhotoRequest
+import com.pharmacy.coldchain.domain.PickStockRequest
+import com.pharmacy.coldchain.domain.PrescriptionReturnRequest
 import com.pharmacy.coldchain.domain.RejudgmentRequest
 import com.pharmacy.coldchain.domain.ResolutionRequest
 import com.pharmacy.coldchain.domain.ReviewRequest
+import com.pharmacy.coldchain.domain.ReReviewRequest
 import com.pharmacy.coldchain.domain.Role
 import com.pharmacy.coldchain.service.FollowUpService
 import com.pharmacy.coldchain.service.OrderService
@@ -90,6 +93,42 @@ class OrderController(
     @PostMapping("/{id}/outbound")
     fun outbound(@PathVariable id: String, @RequestBody req: OutboundRequest, request: HttpServletRequest) =
         Auth.require(request, Role.WAREHOUSE).let { (uid, _) -> orders.outbound(id, req, uid) }
+
+    /** 仓库拣货（出库前锁定库存、医保预结算） */
+    @PostMapping("/{id}/pick-stock")
+    fun pickStock(@PathVariable id: String, @RequestBody req: PickStockRequest, request: HttpServletRequest) =
+        Auth.require(request, Role.WAREHOUSE).let { (uid, _) -> orders.pickStock(id, req, uid) }
+
+    // ---------- 处方退回联动（剂量/适应症不符，暂停出库；已拣货资源同步回滚） ----------
+
+    /** 药师退回处方：暂停出库并通知患者补充材料；已拣货的库存锁定/医保结算同步回滚 */
+    @PostMapping("/{id}/prescription-return")
+    fun prescriptionReturn(@PathVariable id: String, @RequestBody req: PrescriptionReturnRequest, request: HttpServletRequest) =
+        Auth.require(request, Role.PHARMACIST).let { (uid, _) -> orders.prescriptionReturn(id, req, uid) }
+
+    /** 药师对补充材料重新审核：通过则库存重新锁定、医保重新预结算，等待再次确认 */
+    @PostMapping("/{id}/re-review")
+    fun reReview(@PathVariable id: String, @RequestBody req: ReReviewRequest, request: HttpServletRequest) =
+        Auth.require(request, Role.PHARMACIST).let { (uid, _) -> orders.reReview(id, req, uid) }
+
+    /** 恢复出库前药师再次确认 */
+    @PostMapping("/{id}/resume-confirm")
+    fun resumeConfirm(@PathVariable id: String, request: HttpServletRequest) =
+        Auth.require(request, Role.PHARMACIST).let { (uid, _) -> orders.confirmResume(id, uid) }
+
+    /** 处方退回联动记录 */
+    @GetMapping("/{id}/prescription-returns")
+    fun prescriptionReturns(@PathVariable id: String, request: HttpServletRequest): Any {
+        Auth.require(request, Role.PHARMACIST, Role.WAREHOUSE, Role.CUSTOMER_SERVICE, Role.COMPENSATION, Role.INSURANCE)
+        return orders.returns(id)
+    }
+
+    /** 药师留痕（退回/重审/恢复确认全过程） */
+    @GetMapping("/{id}/pharmacist-audit")
+    fun pharmacistAudit(@PathVariable id: String, request: HttpServletRequest): Any {
+        Auth.require(request, Role.PHARMACIST, Role.CUSTOMER_SERVICE, Role.COMPENSATION, Role.ADMIN)
+        return orders.auditList(id)
+    }
 
     /** 药师重新判断药品是否仍可使用 */
     @PostMapping("/{id}/rejudgment")

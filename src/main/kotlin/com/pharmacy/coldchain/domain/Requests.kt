@@ -80,6 +80,31 @@ data class PhotoRequest(
     val note: String? = null
 )
 
+/** 拣货请求（仓库在复核通过、出库前拣货并锁定库存） */
+data class PickStockRequest(
+    val batchNo: String,
+    val pickedBy: String? = null
+)
+
+/** 药师处方退回联动请求（剂量/适应症不符，暂停出库并通知患者补充材料） */
+data class PrescriptionReturnRequest(
+    val reason: PrescriptionReturnReason,
+    val detail: String,
+    val requiredMaterials: List<String> = emptyList()
+)
+
+/** 患者补充材料请求 */
+data class SupplementRequest(
+    val note: String? = null,
+    val photos: List<PhotoRequest> = emptyList()
+)
+
+/** 药师重新审核请求（补充完成后） */
+data class ReReviewRequest(
+    val approved: Boolean,
+    val comment: String? = null
+)
+
 data class RecycleRequest(
     val conditionOk: Boolean,
     val note: String? = null
@@ -119,7 +144,10 @@ data class PharmacyOrderView(
     val resolution: Resolution?,
     val payment: PaymentSplit?,
     val box: ColdChainBox?,
-    val followUps: List<FollowUp>
+    val followUps: List<FollowUp>,
+    val inventoryLock: InventoryLock?,                    // 库存锁定（含回滚/重新锁定时间）
+    val prescriptionReturns: List<PrescriptionReturn>,    // 处方退回联动记录
+    val pharmacistAudit: List<PharmacistAuditEntry>        // 药师留痕
 )
 
 data class OverTempInfo(
@@ -140,6 +168,35 @@ data class RefundInfo(
     val refundedTotalCents: Long
 )
 
+/** 患者端：处方退回联动与恢复出库条件 */
+data class PrescriptionReturnInfo(
+    val active: Boolean,                          // 当前是否处于退回联动流程中
+    val returnId: String?,
+    val reason: PrescriptionReturnReason?,
+    val detail: String?,
+    val status: PrescriptionReturnStatus?,
+    val requiredMaterials: List<String>,         // 需要补充的材料
+    val rollback: ReturnRollbackInfo?,           // 已拣货资源回滚情况
+    val resumeConditions: List<ResumeCondition>, // 恢复出库需满足的条件及满足情况
+    val allConditionsMet: Boolean,               // 条件是否已全部满足
+    val inventoryLockStatus: InventoryLockStatus?,
+    val settlementStatus: SettlementStatus?
+)
+
+data class ReturnRollbackInfo(
+    val drugPicked: Boolean,
+    val inventoryRolledBack: Boolean,
+    val inventoryRolledBackAt: Long?,
+    val settlementRolledBack: Boolean,
+    val settlementRolledBackAt: Long?
+)
+
+/** 恢复出库的单个条件及当前是否满足 */
+data class ResumeCondition(
+    val text: String,
+    val met: Boolean
+)
+
 /** 患者视角：超温、补发、退款、用药提醒的当前状态 */
 data class PatientOrderView(
     val orderId: String,
@@ -152,7 +209,9 @@ data class PatientOrderView(
     val medicationReminders: List<String>,
     val riskReminders: List<String>,
     val sign: SignOff?,
-    val estimatedDeliveryAt: Long?
+    val estimatedDeliveryAt: Long?,
+    val prescriptionReturn: PrescriptionReturnInfo,
+    val notifications: List<PatientNotification>
 )
 
 /** 赔付处理建议（根据异常事件自动推导） */
